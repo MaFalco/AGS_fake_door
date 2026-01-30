@@ -14,134 +14,144 @@ library(plotly)
 library(DT)
 library(stringr)
 
-# --- INSTALACJA PAKIETU DO KLASTRYZACJI (jeśli nie masz) ---
+# Instalacja pakietu do grupowania tekstów (fuzzy matching)
 if(!require(stringdist)) install.packages("stringdist", repos = "[http://cran.us.r-project.org](http://cran.us.r-project.org)")
 library(stringdist)
 
-# --- 1. WCZYTANIE DANYCH ---
+# --- 1. DATA LOADING ---
+# Wczytujemy plik o poprawnej nazwie
 df <- read_csv("ags_fake_door_db_raw.csv", show_col_types = FALSE)
 
-# --- 2. DEFINICJE ---
-oficjalne_Q2 <- c(
-  "Niższe koszty sprzedaży zagranicznej",
-  "Brak konieczności posiadania wiedzy prawno-podatkowej o eksporcie",
-  "Obniżone ryzyko zwrotów zamówień zagranicznych",
-  "Możliwość wyskalowania sprzedaży poza bazowy rynek",
-  "Ciekawość o nowych rynkach"
+# --- 2. TRANSLATION DICTIONARIES (POLISH -> ENGLISH) ---
+
+# Mapping for Q2 (Drivers)
+map_Q2 <- c(
+  "Niższe koszty sprzedaży zagranicznej" = "Lower international sales costs",
+  "Brak konieczności posiadania wiedzy prawno-podatkowej o eksporcie" = "No legal/tax knowledge needed",
+  "Obniżone ryzyko zwrotów zamówień zagranicznych" = "Reduced return risk",
+  "Możliwość wyskalowania sprzedaży poza bazowy rynek" = "Scalability outside base market",
+  "Ciekawość o nowych rynkach" = "Curiosity about new markets"
 )
 
-oficjalne_Q3 <- c(
-  "Nie mam wystarczającej wiedzy o sprzedaży zagranicznej",
-  "Nie potrzebuję skalować sprzedaży na innych rynkach",
-  "Obawiam się dodatkowych wymagań prawno-podatkowych",
-  "Obawiam się rentowności sprzedaży zagranicznej",
-  "Nie chcę podawać powodu"
+# Mapping for Q3 (Barriers)
+map_Q3 <- c(
+  "Nie mam wystarczającej wiedzy o sprzedaży zagranicznej" = "Lack of knowledge",
+  "Nie potrzebuję skalować sprzedaży na innych rynkach" = "No need to scale",
+  "Obawiam się dodatkowych wymagań prawno-podatkowych" = "Fear of legal/tax requirements",
+  "Obawiam się rentowności sprzedaży zagranicznej" = "Profitability concerns",
+  "Nie chcę podawać powodu" = "Prefer not to say"
 )
 
-# --- 3. PRZETWARZANIE I CZYSZCZENIE (POPRAWIONE) ---
+# --- 3. DATA PROCESSING & TRANSLATION ---
+
+# Translate Q1
+df <- df %>%
+  mutate(Q1 = case_when(
+    Q1 == "Tak" ~ "Yes",
+    Q1 == "Nie" ~ "No",
+    TRUE ~ Q1
+  ))
 
 q1_data <- df %>% count(Q1)
 
-process_multiselect <- function(data, col_name, official_list, filter_val) {
+# Function to categorize manual entries based on KEYWORDS
+classify_manual_entry <- function(text, type="Q3") {
+  text_lower <- tolower(text)
+  
+  if (type == "Q3") {
+    case_when(
+      str_detect(text_lower, "vat|podat|księg|rozlicze") ~ "Tax/Accounting Issues",
+      str_detect(text_lower, "czas|brak czasu|zajmuje") ~ "Time Constraints",
+      str_detect(text_lower, "język|barier|angiel") ~ "Language Barriers",
+      str_detect(text_lower, "logist|wysył|kurier|dostaw") ~ "Logistics/Shipping",
+      str_detect(text_lower, "opłac|marż|koszt|zysk") ~ "Profitability/Costs",
+      str_detect(text_lower, "niewiedza|nie wiem|jak zacząć") ~ "Lack of Know-How",
+      TRUE ~ "Other (Manual entry)"
+    )
+  } else {
+    case_when(
+      str_detect(text_lower, "walut|euro") ~ "Currency/Earnings",
+      str_detect(text_lower, "zysk|marż") ~ "Higher Profits",
+      TRUE ~ "Other (Manual entry)"
+    )
+  }
+}
+
+# Main processing function (Handles the '&' separator logic)
+process_multiselect_english <- function(data, col_name, translation_map, filter_val, q_type) {
   data %>%
     filter(Q1 == filter_val) %>%
     select(all_of(col_name)) %>%
-    # POPRAWKA 1: Podział po & niezależnie od spacji (Regex)
-    separate_rows(all_of(col_name), sep = "\\s*&\\s*") %>%
+    # Tu jest kluczowy moment: dzielimy po każdym wystąpieniu "&"
+    separate_rows(all_of(col_name), sep = "\\s*&\\s*") %>% 
     mutate(Response = !!sym(col_name)) %>%
-    # POPRAWKA 2: Usuwanie & z początku i końca, kropek i spacji
+    # Usuwamy "sieroty" (sam znak &)
     mutate(Response = str_remove_all(Response, "^[&]+|[&]+$")) %>% 
-    mutate(Response = str_remove_all(Response, "[.]+$")) %>% # usuwa kropki na końcu
     mutate(Response = str_trim(Response)) %>%
+    # Usuwamy puste wpisy (powstałe np. gdy & był na początku)
     filter(!is.na(Response) & Response != "") %>%
-    mutate(Category = ifelse(Response %in% official_list, Response, "Inne (wpisane ręcznie)"))
+    rowwise() %>%
+    mutate(Category_En = ifelse(Response %in% names(translation_map), 
+                                translation_map[Response], 
+                                classify_manual_entry(Response, q_type))) %>%
+    ungroup()
 }
 
-q2_processed <- process_multiselect(df, "Q2", oficjalne_Q2, "Tak")
-q3_processed <- process_multiselect(df, "Q3", oficjalne_Q3, "Nie")
+# Process Q2 and Q3
+q2_processed <- process_multiselect_english(df, "Q2", map_Q2, "Yes", "Q2")
+q3_processed <- process_multiselect_english(df, "Q3", map_Q3, "No", "Q3")
 
-# Dane do wykresów
+# Prepare Chart Data
 q2_chart_data <- q2_processed %>%
-  count(Category) %>%
-  mutate(Procent = n / sum(df$Q1 == "Tak")) %>% 
+  count(Category_En) %>%
+  mutate(Procent = n / sum(df$Q1 == "Yes")) %>% 
   arrange(desc(Procent))
 
 q3_chart_data <- q3_processed %>%
-  count(Category) %>%
-  mutate(Procent = n / sum(df$Q1 == "Nie")) %>%
+  count(Category_En) %>%
+  mutate(Procent = n / sum(df$Q1 == "No")) %>% 
   arrange(desc(Procent))
 
-# --- 4. ZAAWANSOWANE GRUPOWANIE "INNE" (FUZZY MATCHING) ---
-analyze_others_clustered <- function(processed_data) {
-  
-  # Pobieramy tylko "Inne"
-  others <- processed_data %>%
-    filter(Category == "Inne (wpisane ręcznie)") %>%
-    filter(nchar(Response) > 2) # Odrzucamy śmieci krótsze niż 2 znaki
-  
-  if(nrow(others) == 0) return(data.frame(Grupa = character(), Ilość = integer()))
-  
-  # Liczymy dokładne wystąpienia
-  counts <- others %>% count(Response, sort = TRUE)
-  
-  # Jeśli jest bardzo mało unikalnych odpowiedzi, nie grupujemy
-  if(nrow(counts) < 3) return(counts %>% rename(Grupa_Tematyczna = Response, Liczba = n))
-
-  # KLASTRYZACJA (Grupowanie podobnych napisów)
-  # Metoda 'lv' (Levenshtein) - odległość edycyjna
-  dist_matrix <- stringdistmatrix(counts$Response, counts$Response, method = "lv")
-  # Hierarchiczne klastrowanie
-  hc <- hclust(as.dist(dist_matrix))
-  # Ucinamy drzewo (dopasuj h=3 dla luźniejszego dopasowania lub h=1 dla ścisłego)
-  clusters <- cutree(hc, h = 3)
-  
-  counts$Cluster <- clusters
-  
-  # Wybieramy reprezentanta grupy (najczęstszy wpis w klastrze)
-  final_table <- counts %>%
-    group_by(Cluster) %>%
-    summarise(
-      Grupa_Tematyczna = first(Response), # Reprezentant
-      Warianty = paste(unique(Response), collapse = " | "),
-      Liczba = sum(n)
-    ) %>%
-    arrange(desc(Liczba)) %>%
-    select(Grupa_Tematyczna, Liczba, Warianty)
-    
-  return(final_table)
+# --- TABLE ANALYSIS ---
+prepare_table <- function(data) {
+  data %>%
+    filter(str_detect(Category_En, "Other|Tax|Time|Language|Logistics|Profit|Know-How|Currency")) %>% 
+    count(Category_En, Response, sort = TRUE) %>%
+    rename(English_Group = Category_En, Original_Polish_Text = Response, Count = n)
 }
 
-q2_inne_table <- analyze_others_clustered(q2_processed)
-q3_inne_table <- analyze_others_clustered(q3_processed)
+q2_table <- prepare_table(q2_processed)
+q3_table <- prepare_table(q3_processed)
 
-# --- Q4 LEJEK ---
+# --- Q4 FUNNEL ---
 total_respondents <- nrow(df)
-interested <- sum(df$Q1 == "Tak")
-leads <- df %>% filter(Q1 == "Tak", !is.na(Q4)) %>% nrow()
+interested <- sum(df$Q1 == "Yes")
+leads <- df %>% filter(Q1 == "Yes", !is.na(Q4)) %>% nrow()
 conversion_rate <- round(leads / interested * 100, 1)
+
 ```
 
 ## Row {data-height=150}
 
-### Wszystkich Ankietowanych
+### Total Respondents
 
 ```{r}
 valueBox(total_respondents, icon = "fa-users", color = "#bdc3c7")
 ```
 
-### Zainteresowanych (Tak)
+### Interested (Yes)
 
 ```{r}
 valueBox(interested, icon = "fa-thumbs-up", color = "#2ecc71")
 ```
 
-### Pozyskanych Leadów (Q4)
+### Leads Generated (Q4)
 
 ```{r}
 valueBox(leads, icon = "fa-envelope", color = "#f39c12")
 ```
 
-### Konwersja (z Tak na Lead)
+### Conversion Rate (Yes to Lead)
 
 ```{r}
 valueBox(paste0(conversion_rate, "%"), icon = "fa-percent", color = "#e67e22")
@@ -149,79 +159,81 @@ valueBox(paste0(conversion_rate, "%"), icon = "fa-percent", color = "#e67e22")
 
 ## Row {data-height=400}
 
-### Q1: Czy chcesz sprzedawać swój asortyment za granicą bez dodatkowych kosztów i ryzyk prawno-podatkowych na innych rynkach?
+### AGS Interest Overview
 
 ```{r}
+# Pie Chart in English
 plot_ly(q1_data, labels = ~Q1, values = ~n, type = 'pie', hole = 0.5,
         textinfo = 'label+percent',
         textposition = 'outside', 
         textfont = list(color = '#000000', size = 14, family = "Arial, sans-serif"),
-        marker = list(colors = c('#e74c3c', '#27ae60'))) %>% 
-  layout(title = "Zainteresowanie AGS", 
+        marker = list(colors = c('#e74c3c', '#27ae60'))) %>% # Red / Green
+  layout(title = "Do you want to sell abroad with AGS?", 
          showlegend = TRUE)
 ```
 
-### Q4: Lejek Konwersji
+### Conversion Funnel
 
 ```{r}
-colors_funnel <- c("#bdc3c7", "#2ecc71", "#f39c12")
+# Funnel with matching colors
+colors_funnel <- c("#bdc3c7", "#2ecc71", "#f39c12") # Gray -> Green -> Orange
 
 fig <- plot_ly(
   type = "funnel",
-  y = c("Wszyscy", "Zainteresowani (Q1)", "Zostawili Kontakt (Q4)"),
+  y = c("All Respondents", "Interested (Q1 Yes)", "Left Contact (Q4)"),
   x = c(total_respondents, interested, leads),
   textinfo = "value+percent initial",
   marker = list(colors = colors_funnel)) 
 
-fig <- fig %>% layout(title = "Lejek od wejścia do Leada")
+fig <- fig %>% layout(title = "Funnel: Traffic to Lead")
 fig
 ```
 
 ## Row {data-height=500}
 
-### Q2: Co ma największą wartość? (Grupa TAK)
+### Q2: What brings the most value? (Target Group)
 
 ```{r}
-plot_ly(q2_chart_data, x = ~Procent, y = ~reorder(Category, Procent), type = 'bar', orientation = 'h',
+plot_ly(q2_chart_data, x = ~Procent, y = ~reorder(Category_En, Procent), type = 'bar', orientation = 'h',
         marker = list(color = '#27ae60'),
         text = ~paste0("<b>", round(Procent*100, 1), "%</b>"), 
         textposition = 'outside',
         textfont = list(color = 'black', size = 12)) %>%
   layout(xaxis = list(
            tickformat = ".0%", 
-           title = "% Respondentów", 
-           range = c(0, 1.15)
+           title = "% of Respondents", 
+           range = c(0, 1.25)
          ),
          yaxis = list(title = ""),
          margin = list(l = 250, r = 50))
 ```
 
-### Analiza "Inne" (Automatyczne Grupowanie)
+### "Other" Responses Analysis (Q2)
 
 ```{r}
-datatable(q2_inne_table, options = list(pageLength = 5, scrollY = "300px"), rownames = FALSE)
+datatable(q2_table, options = list(pageLength = 5, scrollY = "300px"), rownames = FALSE)
 ```
 
 ## Row {data-height=500}
 
-### Q3: Dlaczego nie? (Grupa NIE)
+### Q3: Why not? (Barriers)
 
 ```{r}
-plot_ly(q3_chart_data, x = ~Procent, y = ~reorder(Category, Procent), type = 'bar', orientation = 'h',
+plot_ly(q3_chart_data, x = ~Procent, y = ~reorder(Category_En, Procent), type = 'bar', orientation = 'h',
         marker = list(color = '#c0392b'),
         text = ~paste0("<b>", round(Procent*100, 1), "%</b>"), 
         textposition = 'outside',
         textfont = list(color = 'black', size = 12)) %>%
   layout(xaxis = list(
            tickformat = ".0%", 
-           title = "% Respondentów", 
-           range = c(0, 1.15)
+           title = "% of Respondents", 
+           range = c(0, 1.25)
          ),
          yaxis = list(title = ""),
          margin = list(l = 250, r = 50))
 ```
 
-### Analiza "Inne" (Automatyczne Grupowanie)
+### "Other" Responses Analysis (Q3)
 
 ```{r}
-datatable(q3_inne_table, options = list(pageLength = 5, scrollY = "300px"), rownames = FALSE)
+datatable(q3_table, options = list(pageLength = 5, scrollY = "300px"), rownames = FALSE)
