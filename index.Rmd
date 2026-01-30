@@ -14,35 +14,54 @@ library(plotly)
 library(DT)
 library(stringr)
 
-# Instalacja pakietu do grupowania tekstów (fuzzy matching)
-if(!require(stringdist)) install.packages("stringdist", repos = "[http://cran.us.r-project.org](http://cran.us.r-project.org)")
-library(stringdist)
-
 # --- 1. DATA LOADING ---
-# Wczytujemy plik o poprawnej nazwie
 df <- read_csv("ags_fake_door_db_raw.csv", show_col_types = FALSE)
 
-# --- 2. TRANSLATION DICTIONARIES (POLISH -> ENGLISH) ---
+# --- 2. DEFINICJE ETYKIET (TYLKO OFICJALNE ODPOWIEDZI) ---
 
-# Mapping for Q2 (Drivers)
-map_Q2 <- c(
-  "Niższe koszty sprzedaży zagranicznej" = "Lower international sales costs",
-  "Brak konieczności posiadania wiedzy prawno-podatkowej o eksporcie" = "No legal/tax knowledge needed",
-  "Obniżone ryzyko zwrotów zamówień zagranicznych" = "Reduced return risk",
-  "Możliwość wyskalowania sprzedaży poza bazowy rynek" = "Scalability outside base market",
-  "Ciekawość o nowych rynkach" = "Curiosity about new markets"
+labels_Q2_En <- c(
+  "Lower international sales costs",
+  "No legal/tax knowledge needed",
+  "Reduced return risk",
+  "Scalability outside base market",
+  "Curiosity about new markets"
 )
 
-# Mapping for Q3 (Barriers)
-map_Q3 <- c(
-  "Nie mam wystarczającej wiedzy o sprzedaży zagranicznej" = "Lack of knowledge",
-  "Nie potrzebuję skalować sprzedaży na innych rynkach" = "No need to scale",
-  "Obawiam się dodatkowych wymagań prawno-podatkowych" = "Fear of legal/tax requirements",
-  "Obawiam się rentowności sprzedaży zagranicznej" = "Profitability concerns",
-  "Nie chcę podawać powodu" = "Prefer not to say"
+labels_Q3_En <- c(
+  "Lack of knowledge",
+  "No need to scale",
+  "Fear of legal/tax requirements",
+  "Profitability concerns",
+  "Prefer not to say"
 )
 
-# --- 3. DATA PROCESSING & TRANSLATION ---
+# --- 3. FUNKCJA DOPASOWUJĄCA (SKELETON MATCHING) ---
+# Usuwa znaki specjalne, żeby dopasować odpowiedź do wzorca
+
+get_skeleton <- function(x) {
+  x %>%
+    str_to_lower() %>%                 
+    str_replace_all("[^a-ząćęłńóśźż]", "") 
+}
+
+# Wzorce Oficjalne (Polska Kafeteria)
+skeletons_Q2 <- c(
+  get_skeleton("Niższe koszty sprzedaży zagranicznej"),
+  get_skeleton("Brak konieczności posiadania wiedzy prawno-podatkowej o eksporcie"),
+  get_skeleton("Obniżone ryzyko zwrotów zamówień zagranicznych"),
+  get_skeleton("Możliwość wyskalowania sprzedaży poza bazowy rynek"),
+  get_skeleton("Ciekawość o nowych rynkach")
+)
+
+skeletons_Q3 <- c(
+  get_skeleton("Nie mam wystarczającej wiedzy o sprzedaży zagranicznej"),
+  get_skeleton("Nie potrzebuję skalować sprzedaży na innych rynkach"),
+  get_skeleton("Obawiam się dodatkowych wymagań prawno-podatkowych"),
+  get_skeleton("Obawiam się rentowności sprzedaży zagranicznej"),
+  get_skeleton("Nie chcę podawać powodu")
+)
+
+# --- 4. PRZETWARZANIE DANYCH ---
 
 # Translate Q1
 df <- df %>%
@@ -54,54 +73,35 @@ df <- df %>%
 
 q1_data <- df %>% count(Q1)
 
-# Function to categorize manual entries based on KEYWORDS
-classify_manual_entry <- function(text, type="Q3") {
-  text_lower <- tolower(text)
-  
-  if (type == "Q3") {
-    case_when(
-      str_detect(text_lower, "vat|podat|księg|rozlicze") ~ "Tax/Accounting Issues",
-      str_detect(text_lower, "czas|brak czasu|zajmuje") ~ "Time Constraints",
-      str_detect(text_lower, "język|barier|angiel") ~ "Language Barriers",
-      str_detect(text_lower, "logist|wysył|kurier|dostaw") ~ "Logistics/Shipping",
-      str_detect(text_lower, "opłac|marż|koszt|zysk") ~ "Profitability/Costs",
-      str_detect(text_lower, "niewiedza|nie wiem|jak zacząć") ~ "Lack of Know-How",
-      TRUE ~ "Other (Manual entry)"
-    )
-  } else {
-    case_when(
-      str_detect(text_lower, "walut|euro") ~ "Currency/Earnings",
-      str_detect(text_lower, "zysk|marż") ~ "Higher Profits",
-      TRUE ~ "Other (Manual entry)"
-    )
-  }
-}
-
-# Main processing function (Handles the '&' separator logic)
-process_multiselect_english <- function(data, col_name, translation_map, filter_val, q_type) {
+# Główna funkcja przetwarzająca (BEZ klasyfikacji ręcznej)
+process_data <- function(data, col_name, skeletons, labels, filter_val) {
   data %>%
     filter(Q1 == filter_val) %>%
     select(all_of(col_name)) %>%
-    # Tu jest kluczowy moment: dzielimy po każdym wystąpieniu "&"
-    separate_rows(all_of(col_name), sep = "\\s*&\\s*") %>% 
+    separate_rows(all_of(col_name), sep = "&") %>% 
     mutate(Response = !!sym(col_name)) %>%
-    # Usuwamy "sieroty" (sam znak &)
-    mutate(Response = str_remove_all(Response, "^[&]+|[&]+$")) %>% 
-    mutate(Response = str_trim(Response)) %>%
-    # Usuwamy puste wpisy (powstałe np. gdy & był na początku)
     filter(!is.na(Response) & Response != "") %>%
     rowwise() %>%
-    mutate(Category_En = ifelse(Response %in% names(translation_map), 
-                                translation_map[Response], 
-                                classify_manual_entry(Response, q_type))) %>%
+    mutate(
+      # Tworzymy "szkielet" z odpowiedzi użytkownika
+      Response_Skeleton = get_skeleton(Response),
+      
+      # Sprawdzamy czy pasuje do oficjalnej listy
+      Match_Index = match(Response_Skeleton, skeletons),
+      
+      # LOGIKA: Pasuje -> angielska nazwa. Nie pasuje -> Other.
+      Category_En = ifelse(!is.na(Match_Index), 
+                           labels[Match_Index], 
+                           "Other (Manual entry)")
+    ) %>%
     ungroup()
 }
 
-# Process Q2 and Q3
-q2_processed <- process_multiselect_english(df, "Q2", map_Q2, "Yes", "Q2")
-q3_processed <- process_multiselect_english(df, "Q3", map_Q3, "No", "Q3")
+# Przetwarzanie Q2 i Q3
+q2_processed <- process_data(df, "Q2", skeletons_Q2, labels_Q2_En, "Yes")
+q3_processed <- process_data(df, "Q3", skeletons_Q3, labels_Q3_En, "No")
 
-# Prepare Chart Data
+# Dane do wykresów
 q2_chart_data <- q2_processed %>%
   count(Category_En) %>%
   mutate(Procent = n / sum(df$Q1 == "Yes")) %>% 
@@ -112,12 +112,12 @@ q3_chart_data <- q3_processed %>%
   mutate(Procent = n / sum(df$Q1 == "No")) %>% 
   arrange(desc(Procent))
 
-# --- TABLE ANALYSIS ---
+# Dane do tabeli (Tylko wpisy ręczne)
 prepare_table <- function(data) {
   data %>%
-    filter(str_detect(Category_En, "Other|Tax|Time|Language|Logistics|Profit|Know-How|Currency")) %>% 
-    count(Category_En, Response, sort = TRUE) %>%
-    rename(English_Group = Category_En, Original_Polish_Text = Response, Count = n)
+    filter(Category_En == "Other (Manual entry)") %>% 
+    count(Response, sort = TRUE) %>%
+    rename(Original_Polish_Text = Response, Count = n)
 }
 
 q2_table <- prepare_table(q2_processed)
@@ -162,12 +162,11 @@ valueBox(paste0(conversion_rate, "%"), icon = "fa-percent", color = "#e67e22")
 ### AGS Interest Overview
 
 ```{r}
-# Pie Chart in English
 plot_ly(q1_data, labels = ~Q1, values = ~n, type = 'pie', hole = 0.5,
         textinfo = 'label+percent',
         textposition = 'outside', 
         textfont = list(color = '#000000', size = 14, family = "Arial, sans-serif"),
-        marker = list(colors = c('#e74c3c', '#27ae60'))) %>% # Red / Green
+        marker = list(colors = c('#e74c3c', '#27ae60'))) %>% 
   layout(title = "Do you want to sell abroad with AGS?", 
          showlegend = TRUE)
 ```
@@ -175,8 +174,7 @@ plot_ly(q1_data, labels = ~Q1, values = ~n, type = 'pie', hole = 0.5,
 ### Conversion Funnel
 
 ```{r}
-# Funnel with matching colors
-colors_funnel <- c("#bdc3c7", "#2ecc71", "#f39c12") # Gray -> Green -> Orange
+colors_funnel <- c("#bdc3c7", "#2ecc71", "#f39c12")
 
 fig <- plot_ly(
   type = "funnel",
